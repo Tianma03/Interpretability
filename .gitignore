@@ -1,0 +1,35 @@
+# Generated training runs, checkpoints, logs, and evaluation results.
+/runs/
+/outputs/
+/checkpoints/
+/logs/
+/wandb/
+
+# Model weights and exported models, including files outside output folders.
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+
+# Runtime logs and TensorBoard events.
+*.log
+log.txt
+metrics.jsonl
+events.out.tfevents.*
+
+# Python and notebook caches.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Local datasets and serialized label files. Keep data/*.py tracked.
+/dataset/
+*.pkl
+*.pickle
+
+# Machine-specific environment settings.
+.env
+.env.*
+!.env.example
