@@ -1,8 +1,8 @@
 """Generate noisy labels for train only, or for train + val in ckpt=1 mode.
 
 Concept noise flips binary labels; class noise replaces labels with a different
-class. Images and other metadata are preserved. A fixed number of entries is
-sampled without replacement, rather than drawing Bernoulli noise per entry.
+class. Images and other metadata are preserved. Global noise samples a fixed
+count of entries. CPO noise flips a fixed count per image using a path-derived seed.
 Test labels always remain clean. With ckpt=0, validation labels also remain clean.
 """
 
@@ -42,6 +42,49 @@ def add_concept_noise(
                                 for j, elem in enumerate(d['attribute_label'])]
         return d
 
+    return create_new_dataset(out_dir, noise_fn, datasets=datasets, data_dir=data_dir)
+
+
+def cpo_image_identifier(stored_path, image_dir):
+    """Use the local image path, as returned by the CPO CUB DataLoader."""
+    stored_path = Path(stored_path)
+    if 'images' in stored_path.parts:
+        images_index = stored_path.parts.index('images')
+        relative_path = Path(*stored_path.parts[images_index + 1:])
+    elif stored_path.is_absolute():
+        relative_path = Path(*stored_path.parts[-2:])
+    else:
+        relative_path = stored_path
+    return str(Path(image_dir).expanduser().resolve() / relative_path)
+
+
+def add_cpo_concept_noise(
+    out_dir, data_dir, noise_rate, image_dir, seed=24,
+    n_concepts=112, datasets=('train',),
+):
+    """Match CPO's per-image randperm and sum(ord(path)) + seed rule.
+
+    Reference: Emilianopp/ConceptPreferenceOptimization, commit de4d517.
+    Use a local CPU generator to reproduce its mask without changing global RNGs.
+    Equal character sums intentionally share masks, matching the reference code.
+    """
+    import torch
+
+    flips_per_image = int(noise_rate * n_concepts)
+
+    def noise_fn(record, sample_index):
+        identifier = cpo_image_identifier(record['img_path'], image_dir)
+        sample_seed = sum(ord(char) for char in identifier) + seed
+        generator = torch.Generator(device='cpu').manual_seed(sample_seed)
+        indices = torch.randperm(n_concepts, generator=generator)[:flips_per_image]
+
+        labels = list(record['attribute_label'])
+        for concept_index in indices.tolist():
+            labels[concept_index] = 1 - labels[concept_index]
+        record['attribute_label'] = labels
+        return record
+
+    print(f'CPO noise: {flips_per_image}/{n_concepts} concepts per image')
     return create_new_dataset(out_dir, noise_fn, datasets=datasets, data_dir=data_dir)
 
 
@@ -200,6 +243,11 @@ if __name__ == '__main__':
     parser.add_argument('--n_classes', '--n-classes', type=int, default=200)
     parser.add_argument('--seed', type=int, default=23)
     parser.add_argument(
+        '--concept-noise-mode', choices=['global', 'cpo'], default='global',
+        help='global: fixed total flip count; cpo: fixed per-image count with path-derived seeds',
+    )
+    parser.add_argument('--image-dir', help='Local CUB images root used for CPO image identifiers')
+    parser.add_argument(
         '--ckpt', type=int, choices=[0, 1], default=0,
         help='0: noise on train only; 1: noise across train + val for merged-split training',
     )
@@ -209,6 +257,11 @@ if __name__ == '__main__':
         parser.error('noise_rate must be between 0 and 1')
     if args.n_concepts < 1 or args.n_classes < 2:
         parser.error('n_concepts must be positive and n_classes must be at least 2')
+    if args.concept_noise_mode == 'cpo':
+        if args.exp != 'concept':
+            parser.error('CPO noise mode supports --exp concept only')
+        if args.image_dir is None or not Path(args.image_dir).expanduser().is_dir():
+            parser.error('CPO noise mode requires --image-dir pointing to the local images root')
 
     data_dir = Path(args.data_dir).expanduser().resolve()
     out_dir = Path(args.out_dir).expanduser().resolve()
@@ -225,6 +278,7 @@ if __name__ == '__main__':
 
     noisy_splits = ('train', 'val') if args.ckpt else ('train',)
     dataset_size = 0
+    cpo_sample_seeds = set()
     for split in noisy_splits:
         with (data_dir / f'{split}.pkl').open('rb') as file:
             records = pickle.load(file)
@@ -237,13 +291,22 @@ if __name__ == '__main__':
             parser.error('Concept noise requires binary concept labels')
         if any(not 0 <= record['class_label'] < args.n_classes for record in records):
             parser.error(f'{split} class labels must be in [0, n_classes)')
+        if args.concept_noise_mode == 'cpo':
+            for record in records:
+                identifier = cpo_image_identifier(record['img_path'], args.image_dir)
+                cpo_sample_seeds.add(sum(ord(char) for char in identifier) + args.seed)
         dataset_size += len(records)
         del records, labels
     print(args)
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    if args.exp == 'concept':
+    if args.concept_noise_mode == 'cpo':
+        statistics = add_cpo_concept_noise(
+            out_dir, data_dir, args.noise_rate, args.image_dir,
+            seed=args.seed, n_concepts=args.n_concepts, datasets=noisy_splits,
+        )
+    elif args.exp == 'concept':
         statistics = add_concept_noise(
             out_dir, data_dir, args.noise_rate,
             n_concepts=args.n_concepts, n_images=dataset_size, datasets=noisy_splits,
@@ -283,7 +346,19 @@ if __name__ == '__main__':
         'noisy_splits': list(noisy_splits),
         'statistics': statistics,
         'combined_statistics': combined_statistics,
+        'concept_noise_mode': args.concept_noise_mode,
+        'realized_concept_noise_rate': (
+            combined_statistics['concept_changed'] / combined_statistics['concept_entries']
+        ),
     }
+    if args.concept_noise_mode == 'cpo':
+        metadata.update({
+            'image_dir': str(Path(args.image_dir).expanduser().resolve()),
+            'flips_per_image': int(args.noise_rate * args.n_concepts),
+            'sample_seed_rule': 'sum(ord(char) for char in local_image_path) + seed',
+            'unique_sample_seeds': len(cpo_sample_seeds),
+            'reference_commit': 'de4d51738b7d18935255ca9690b1c7d5d36fa05e',
+        })
     with (out_dir / 'noise_config.json').open('w', encoding='utf-8') as file:
         json.dump(metadata, file, indent=2)
     print(f'Saved noisy dataset to: {out_dir}')
