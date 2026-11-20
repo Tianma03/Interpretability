@@ -1,4 +1,4 @@
-"""Explicit ResNet18 backbone for concept bottleneck models.
+"""ImageNet- and CUB-pretrained backbones for concept bottleneck models.
 
 ResNet architecture follows torchvision's ResNet implementation:
 https://github.com/pytorch/vision/blob/main/torchvision/models/resnet.py
@@ -9,151 +9,153 @@ from typing import Callable, Optional
 import torch
 from torch import Tensor
 from torch import nn
-from torchvision.models import ResNet18_Weights
+from torchvision.models import resnet18 as tv_resnet18, ResNet18_Weights
+from types import MethodType
 
 
-def conv3x3(
-    in_planes: int,
-    out_planes: int,
-    stride: int = 1,
-    groups: int = 1,
-    dilation: int = 1,
-) -> nn.Conv2d:
-    return nn.Conv2d(
-        in_planes, out_planes, kernel_size=3, stride=stride,
-        padding=dilation, groups=groups, bias=False, dilation=dilation,
-    )
+# def conv3x3(
+#     in_planes: int,
+#     out_planes: int,
+#     stride: int = 1,
+#     groups: int = 1,
+#     dilation: int = 1,
+# ) -> nn.Conv2d:
+#     return nn.Conv2d(
+#         in_planes, out_planes, kernel_size=3, stride=stride,
+#         padding=dilation, groups=groups, bias=False, dilation=dilation,
+#     )
 
 
-def conv1x1(in_planes: int, out_planes: int, stride: int = 1) -> nn.Conv2d:
-    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+# def conv1x1(in_planes: int, out_planes: int, stride: int = 1) -> nn.Conv2d:
+#     return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
 
 
-class BasicBlock(nn.Module):
-    expansion: int = 1
+# class BasicBlock(nn.Module):
+#     expansion: int = 1
 
-    def __init__(
-        self,
-        inplanes: int,
-        planes: int,
-        stride: int = 1,
-        downsample: Optional[nn.Module] = None,
-        groups: int = 1,
-        base_width: int = 64,
-        dilation: int = 1,
-        norm_layer: Optional[Callable[..., nn.Module]] = None,
-    ) -> None:
-        super().__init__()
-        if norm_layer is None:
-            norm_layer = nn.BatchNorm2d
-        if groups != 1 or base_width != 64:
-            raise ValueError("BasicBlock only supports groups=1 and base_width=64")
-        if dilation > 1:
-            raise NotImplementedError("Dilation > 1 is not supported in BasicBlock")
-        self.conv1 = conv3x3(inplanes, planes, stride)
-        self.bn1 = norm_layer(planes)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = conv3x3(planes, planes)
-        self.bn2 = norm_layer(planes)
-        self.downsample = downsample
-        self.stride = stride
+#     def __init__(
+#         self,
+#         inplanes: int,
+#         planes: int,
+#         stride: int = 1,
+#         downsample: Optional[nn.Module] = None,
+#         groups: int = 1,
+#         base_width: int = 64,
+#         dilation: int = 1,
+#         norm_layer: Optional[Callable[..., nn.Module]] = None,
+#     ) -> None:
+#         super().__init__()
+#         if norm_layer is None:
+#             norm_layer = nn.BatchNorm2d
+#         if groups != 1 or base_width != 64:
+#             raise ValueError("BasicBlock only supports groups=1 and base_width=64")
+#         if dilation > 1:
+#             raise NotImplementedError("Dilation > 1 is not supported in BasicBlock")
+#         self.conv1 = conv3x3(inplanes, planes, stride)
+#         self.bn1 = norm_layer(planes)
+#         self.relu = nn.ReLU(inplace=True)
+#         self.conv2 = conv3x3(planes, planes)
+#         self.bn2 = norm_layer(planes)
+#         self.downsample = downsample
+#         self.stride = stride
 
-    def forward(self, x: Tensor) -> Tensor:
-        identity = x
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        if self.downsample is not None:
-            identity = self.downsample(x)
-        out = self.relu(out + identity)
-        return out
+#     def forward(self, x: Tensor) -> Tensor:
+#         identity = x
+#         out = self.relu(self.bn1(self.conv1(x)))
+#         out = self.bn2(self.conv2(out))
+#         if self.downsample is not None:
+#             identity = self.downsample(x)
+#         out = self.relu(out + identity)
+#         return out
 
 
-class ResNet(nn.Module):
-    """ResNet with explicit layers and an accessible feature extractor.
+# class ResNet(nn.Module):
+#     """ResNet with explicit layers and an accessible feature extractor.
 
-    While fc is a Linear layer, forward(x) returns class logits.
-    Replacing fc with nn.Identity() makes forward(x) return pooled features.
-    """
+#     While fc is a Linear layer, forward(x) returns class logits.
+#     Replacing fc with nn.Identity() makes forward(x) return pooled features.
+#     """
 
-    def __init__(
-        self,
-        block: type[BasicBlock],
-        layers: list[int],
-        num_classes: int = 1000,
-        norm_layer: Optional[Callable[..., nn.Module]] = None,
-    ) -> None:
-        super().__init__()
-        if norm_layer is None:
-            norm_layer = nn.BatchNorm2d
-        self._norm_layer = norm_layer
-        self.inplanes = 64
-        self.dilation = 1
-        self.groups = 1
-        self.base_width = 64
+#     def __init__(
+#         self,
+#         block: type[BasicBlock],
+#         layers: list[int],
+#         num_classes: int = 1000,
+#         norm_layer: Optional[Callable[..., nn.Module]] = None,
+#     ) -> None:
+#         super().__init__()
+#         if norm_layer is None:
+#             norm_layer = nn.BatchNorm2d
+#         self._norm_layer = norm_layer
+#         self.inplanes = 64
+#         self.dilation = 1
+#         self.groups = 1
+#         self.base_width = 64
 
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = norm_layer(64)
-        self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+#         self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+#         self.bn1 = norm_layer(64)
+#         self.relu = nn.ReLU(inplace=True)
+#         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
-        self.layer1 = self._make_layer(block, 64, layers[0])
-        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
-        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
-        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.feature_dim = 512 * block.expansion
-        self.fc = nn.Linear(self.feature_dim, num_classes)
+#         self.layer1 = self._make_layer(block, 64, layers[0])
+#         self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+#         self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+#         self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+#         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+#         self.feature_dim = 512 * block.expansion
+#         self.fc = nn.Linear(self.feature_dim, num_classes)
 
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+#         for m in self.modules():
+#             if isinstance(m, nn.Conv2d):
+#                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+#             elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+#                 nn.init.constant_(m.weight, 1)
+#                 nn.init.constant_(m.bias, 0)
 
-    def _make_layer(
-        self, block: type[BasicBlock], planes: int, blocks: int, stride: int = 1
-    ) -> nn.Sequential:
-        if blocks < 1:
-            raise ValueError("blocks must be >= 1")
-        downsample = None
-        if stride != 1 or self.inplanes != planes * block.expansion:
-            downsample = nn.Sequential(
-                conv1x1(self.inplanes, planes * block.expansion, stride),
-                self._norm_layer(planes * block.expansion),
-            )
-        stage = [
-            block(
-                self.inplanes, planes, stride=stride, downsample=downsample,
-                groups=self.groups, base_width=self.base_width,
-                dilation=self.dilation, norm_layer=self._norm_layer,
-            )
-        ]
-        self.inplanes = planes * block.expansion
-        for _ in range(1, blocks):
-            stage.append(
-                block(
-                    self.inplanes, planes,
-                    groups=self.groups, base_width=self.base_width,
-                    dilation=self.dilation, norm_layer=self._norm_layer,
-                )
-            )
-        return nn.Sequential(*stage)
+#     def _make_layer(
+#         self, block: type[BasicBlock], planes: int, blocks: int, stride: int = 1
+#     ) -> nn.Sequential:
+#         if blocks < 1:
+#             raise ValueError("blocks must be >= 1")
+#         downsample = None
+#         if stride != 1 or self.inplanes != planes * block.expansion:
+#             downsample = nn.Sequential(
+#                 conv1x1(self.inplanes, planes * block.expansion, stride),
+#                 self._norm_layer(planes * block.expansion),
+#             )
+#         stage = [
+#             block(
+#                 self.inplanes, planes, stride=stride, downsample=downsample,
+#                 groups=self.groups, base_width=self.base_width,
+#                 dilation=self.dilation, norm_layer=self._norm_layer,
+#             )
+#         ]
+#         self.inplanes = planes * block.expansion
+#         for _ in range(1, blocks):
+#             stage.append(
+#                 block(
+#                     self.inplanes, planes,
+#                     groups=self.groups, base_width=self.base_width,
+#                     dilation=self.dilation, norm_layer=self._norm_layer,
+#                 )
+#             )
+#         return nn.Sequential(*stage)
 
-    def forward_features(self, x: Tensor, return_maps: bool = False):
-        x = self.maxpool(self.relu(self.bn1(self.conv1(x))))
-        f1 = self.layer1(x)
-        f2 = self.layer2(f1)
-        f3 = self.layer3(f2)
-        f4 = self.layer4(f3)
-        features = torch.flatten(self.avgpool(f4), 1)
-        if return_maps:
-            return features, {"layer1": f1, "layer2": f2, "layer3": f3, "layer4": f4}
-        return features
+#     def forward_features(self, x: Tensor, return_maps: bool = False):
+#         x = self.maxpool(self.relu(self.bn1(self.conv1(x))))
+#         f1 = self.layer1(x)
+#         f2 = self.layer2(f1)
+#         f3 = self.layer3(f2)
+#         f4 = self.layer4(f3)
+#         features = torch.flatten(self.avgpool(f4), 1)
+#         if return_maps:
+#             return features, {"layer1": f1, "layer2": f2, "layer3": f3, "layer4": f4}
+#         return features
 
-    def forward(self, x: Tensor) -> Tensor:
-        features = self.forward_features(x)
-        return self.fc(features)
+#     def forward(self, x: Tensor) -> Tensor:
+#         features = self.forward_features(x)
+#         return self.fc(features)
+
 
 class ResNet18PTCVCUB(nn.Module):
     """
@@ -328,24 +330,44 @@ class CLIPViT(nn.Module):
 def clip_vit_b_16(pretrained: bool = True):
     return CLIPViT(pretrained=pretrained)     
         
-           
-def resnet18(pretrained: bool = False, features_only: bool = True) -> ResNet:
-    """Make ResNet18; optionally load official ImageNet weights.
+def _resnet18_forward_features(self, x, return_maps=False):
+    x = self.maxpool(self.relu(self.bn1(self.conv1(x))))
 
-    features_only=True: returns [B,512] rather than ImageNet class logits.
-    When pretrained=True, network download may be required the first time.
-    """
-    model = ResNet(BasicBlock, [2, 2, 2, 2], num_classes=1000)
-    if pretrained:
-        weights = ResNet18_Weights.DEFAULT.get_state_dict(progress=True, check_hash=True)
-        model.load_state_dict(weights, strict=True)
+    f1 = self.layer1(x)
+    f2 = self.layer2(f1)
+    f3 = self.layer3(f2)
+    f4 = self.layer4(f3)
+
+    features = torch.flatten(self.avgpool(f4), 1)
+
+    if return_maps:
+        return features, {
+            "layer1": f1,
+            "layer2": f2,
+            "layer3": f3,
+            "layer4": f4,
+        }
+    return features
+         
+def resnet18(pretrained=True, features_only=True):
+    weights = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+    model = tv_resnet18(weights=weights)
+
+    model.feature_dim = 512
+    model.forward_features = MethodType(_resnet18_forward_features, model)
+
     if features_only:
         model.fc = nn.Identity()
+
     return model
 
 
 def get_backbone(name: str, pretrained: bool = True):
-    """Return a feature-only backbone. Feature dimension: model.feature_dim."""
+    """Return a feature-only backbone with model.feature_dim.
+
+    resnet18 uses ImageNet weights; resnet18_ptcv_cub uses CUB weights.
+    The pretrained flag controls weight loading for every supported backbone.
+    """
     constructors = {
         "resnet18": lambda: resnet18(pretrained=pretrained, features_only=True),
         "resnet18_ptcv_cub": lambda: resnet18_ptcv_cub(pretrained=pretrained, features_only=True),
