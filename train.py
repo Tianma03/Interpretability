@@ -2,10 +2,11 @@
 
 Reference: https://github.com/yewsiang/ConceptBottleneck/blob/master/CUB/train.py
 
-The objective, optimizers, learning-rate schedule, model selection, early stopping,
-and epoch summary follow the original Joint training code. ResNet18 uses 224-pixel
-inputs and has no Inception auxiliary branch. ImageNet normalization is used for
-the ResNet backbones by default; --normalization upstream selects the original
+The objective, optimizers, learning-rate schedule, model selection, and epoch
+summary follow the original Joint training code. Early stopping retains the
+100-epoch accuracy patience but removes the upstream low-accuracy cutoff.
+ResNet18 uses 224-pixel inputs and has no Inception auxiliary branch. ImageNet
+normalization is used for the ResNet backbones by default; --normalization upstream selects the original
 dataset.py normalization instead. No test data is used for model selection.
 Defaults follow the upstream Joint0.01 seed-1 recipe: SGD, lr=0.001,
 weight_decay=0.0004, batch_size=64, and scheduler_step=1000.
@@ -30,6 +31,7 @@ import torch
 from data.dataload import find_class_imbalance, load_data
 
 from model.cbm import JointCBM
+from model.cem import ConceptEmbeddingModel
 from utils.loss import JointCBMLoss
 
 
@@ -145,8 +147,12 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
                 dtype=torch.float32,
                 non_blocking=True,
             )
-
-            outputs = model(images)
+            # Pass concept labels to CEM only during training.
+            if is_training and isinstance(model, ConceptEmbeddingModel):
+                outputs = model(images, concept=concept_labels)
+            else:
+                outputs= model(images)
+                
             losses = criterion(
                 outputs,
                 class_labels,
@@ -210,20 +216,35 @@ def train(args):
     device = torch.device(device_name)
 
     if args.log_dir is None:
-        args.log_dir = str(Path(__file__).parent / "runs" / f"joint_cbm_seed{args.seed}")
+        model_tag = "joint_cbm" if args.model == "cbm" else "cem"
+        args.log_dir = str(Path(__file__).parent / "runs" / f"{model_tag}_seed{args.seed}")
     log_dir = Path(args.log_dir).expanduser().resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
 
     train_loader, val_loader, imbalance = build_loaders(args, device)
-    model = JointCBM(
-        backbone_name=args.backbone,
-        pretrained=args.pretrained,
-        num_concepts=NUM_CONCEPTS,
-        num_classes=NUM_CLASSES,
-        concept_activation=args.concept_activation,
-        freeze_backbone=args.freeze_backbone,
-    ).to(device)
-
+    if args.model == "cem":
+        model = ConceptEmbeddingModel(
+            backbone=args.backbone,
+            pretrained=args.pretrained,
+            n_concepts=NUM_CLASSES,
+            n_tasks=NUM_CLASSES,
+            emb_size=args.emb_size,
+            training_intervention_prob=0.25,
+            c2y_layers=None, # Use a linear class head.
+        )
+    else:
+        model = JointCBM(
+            backbone_name=args.backbone,
+            pretrained=args.pretrained,
+            num_concepts=NUM_CONCEPTS,
+            num_classes=NUM_CLASSES,
+            concept_activation=args.concept_activation,
+            freeze_backbone=args.freeze_backbone,
+        )
+    if args.freeze_backbone:
+        for parameter in model.backbone.parameters():
+            parameter.requires_grad_(False)
+    model = model.to(device)
     criterion = JointCBMLoss(
         attr_loss_weight=args.attr_loss_weight,
         num_concepts=NUM_CONCEPTS,
@@ -267,7 +288,10 @@ def train(args):
                     best_val_acc = val_metrics["accuracy"]
                     logger.write("New model best model at epoch %d\n" % epoch)
                     # Preserve the upstream whole-model artifact and filename.
-                    torch.save(model, log_dir / f"best_model_{args.seed}.pth")
+                    torch.save(
+                        {"model_state_dict": model.state_dict()},
+                        log_dir / f"best_model_{args.seed}.pth",
+                    )
 
                 logger.write(
                     "Epoch [%d]:\tTrain loss: %.4f\tTrain accuracy: %.4f\t"
@@ -322,9 +346,6 @@ def train(args):
                     "best_val_accuracy": best_val_acc,
                 }, log_dir / "last_checkpoint.pth")
 
-                if epoch >= 100 and val_metrics["accuracy"] < 3:
-                    logger.write("Early stopping because of low accuracy\n")
-                    break
                 if epoch - best_val_epoch >= 100:
                     logger.write("Early stopping because acc hasn't improved for a long time\n")
                     break
@@ -343,6 +364,7 @@ def parse_args(argv=None):
     parser.add_argument("--image-dir", "-image_dir", required=True, help="Root of CUB_200_2011/images")
     parser.add_argument("--log-dir", "-log_dir", default=None)
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--model", choices=["cbm", "cem"], default="cbm")
     parser.add_argument("--backbone", choices=["resnet18", "resnet18_ptcv_cub"], default="resnet18")
     parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--freeze-backbone", action="store_true")
