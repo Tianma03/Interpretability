@@ -228,7 +228,7 @@ def train(args):
             pretrained=args.pretrained,
             n_concepts=NUM_CLASSES,
             n_tasks=NUM_CLASSES,
-            emb_size=args.emb_size,
+            emb_size=16,
             training_intervention_prob=0.25,
             c2y_layers=None, # Use a linear class head.
         )
