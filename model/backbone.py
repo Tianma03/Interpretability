@@ -10,8 +10,72 @@ import torch
 from torch import Tensor
 from torch import nn
 from torchvision.models import resnet18 as tv_resnet18, ResNet18_Weights
+from torchvision.models import resnet50 as tv_resnet50, ResNet50_Weights
 from types import MethodType
 
+class ResNet18FeatureExtractor(nn.Module):
+    feature_dim = 512
+
+    def __init__(self, pretrained=True):
+        super().__init__()
+        weights = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+        self.encoder = tv_resnet18(weights=weights)
+        self.encoder.fc = nn.Identity()
+
+    def forward_features(self, x, return_maps=False):
+        m = self.encoder
+        x = m.maxpool(m.relu(m.bn1(m.conv1(x))))
+
+        f1 = m.layer1(x)
+        f2 = m.layer2(f1)
+        f3 = m.layer3(f2)
+        f4 = m.layer4(f3)
+
+        features = torch.flatten(m.avgpool(f4), 1)
+
+        if return_maps:
+            return features, {
+                "layer1": f1,
+                "layer2": f2,
+                "layer3": f3,
+                "layer4": f4,
+            }
+        return features
+
+    def forward(self, x):
+        return self.forward_features(x)
+
+class ResNet50FeatureExtractor(nn.Module):
+    feature_dim = 2048
+
+    def __init__(self, pretrained=True):
+        super().__init__()
+        weights = ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
+        self.encoder = tv_resnet50(weights=weights)
+        self.encoder.fc = nn.Identity()
+
+    def forward_features(self, x, return_maps=False):
+        m = self.encoder
+        x = m.maxpool(m.relu(m.bn1(m.conv1(x))))
+
+        f1 = m.layer1(x)
+        f2 = m.layer2(f1)
+        f3 = m.layer3(f2)
+        f4 = m.layer4(f3)
+
+        features = torch.flatten(m.avgpool(f4), 1)
+
+        if return_maps:
+            return features, {
+                "layer1": f1,
+                "layer2": f2,
+                "layer3": f3,
+                "layer4": f4,
+            }
+        return features
+
+    def forward(self, x):
+        return self.forward_features(x)
 
 # def conv3x3(
 #     in_planes: int,
@@ -230,6 +294,9 @@ class ResNet18PTCVCUB(nn.Module):
 def resnet18_ptcv_cub(pretrained=True,features_only=True,):
     return ResNet18PTCVCUB(pretrained=pretrained,features_only=features_only,)
 
+def resnet50(pretrained=True, features_only=True):
+    return ResNet50FeatureExtractor(pretrained=pretrained)
+
 class TorchVisionViT(nn.Module):
     """ViT-B/16 image encoder, exposing pooled CLS and spatial patch outputs."""
 
@@ -350,16 +417,7 @@ def _resnet18_forward_features(self, x, return_maps=False):
     return features
          
 def resnet18(pretrained=True, features_only=True):
-    weights = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
-    model = tv_resnet18(weights=weights)
-
-    model.feature_dim = 512
-    model.forward_features = MethodType(_resnet18_forward_features, model)
-
-    if features_only:
-        model.fc = nn.Identity()
-
-    return model
+    return ResNet18FeatureExtractor(pretrained=pretrained)
 
 
 def get_backbone(name: str, pretrained: bool = True):
@@ -371,6 +429,7 @@ def get_backbone(name: str, pretrained: bool = True):
     constructors = {
         "resnet18": lambda: resnet18(pretrained=pretrained, features_only=True),
         "resnet18_ptcv_cub": lambda: resnet18_ptcv_cub(pretrained=pretrained, features_only=True),
+        "resnet50": lambda: resnet50(pretrained=pretrained, features_only=True),  
         "vit_b_16": lambda: vit_b_16(pretrained=pretrained),
         "clip_vit_b_16": lambda: clip_vit_b_16(pretrained=pretrained),
     }
