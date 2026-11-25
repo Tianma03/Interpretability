@@ -4,6 +4,16 @@ For each image, K is its number of positive ground-truth concepts. Concept
 Accuracy is the total number of positive labels among the predicted Top-K
 concepts divided by the total number of positive labels across the dataset.
 Class Accuracy is Top-1 accuracy. Both accuracies are reported as percentages.
+
+python evaluate.py \
+    --checkpoint runs/cbm_cem_clean_lr0.001_wd0.00004_lambda0.01_plateau.XXXXXX/cbm_seed1/attempt1/best_model_1.pth \
+    --model-type cbm \
+    --backbone resnet50 \
+    --concept-activation sigmoid \
+    --split test \
+    --batch-size 64 \
+    --num-workers 8 \
+    --output eval_test.json
 """
 
 import argparse
@@ -15,7 +25,7 @@ from torch import nn
 
 from data.dataload import load_data
 from model.cbm import JointCBM
-
+from model.cem import ConceptEmbeddingModel  # Add CEM support.
 
 PROJECT_DIR = Path(__file__).resolve().parent
 
@@ -47,14 +57,8 @@ def topk_concept_counts(concept_scores, concept_labels):
     return correct_count, total_count
 
 
-def load_model(checkpoint_path, device):
-    """Load either best_model_<seed>.pth or the training state-dict checkpoint."""
-    # Existing best-model files contain a complete JointCBM module.
-    checkpoint = torch.load(
-        checkpoint_path,
-        map_location="cpu",
-        weights_only=False,
-    )
+def load_model(checkpoint_path, device, model_type=None, backbone=None, concept_activation=None):
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     training_args = {}
 
     if isinstance(checkpoint, nn.Module):
@@ -63,22 +67,42 @@ def load_model(checkpoint_path, device):
         training_args = checkpoint.get("args", {})
         if isinstance(training_args, argparse.Namespace):
             training_args = vars(training_args)
-        if not isinstance(training_args, dict) or "backbone" not in training_args:
-            raise ValueError("State-dict checkpoints must include args.backbone")
+        if not isinstance(training_args, dict):
+            training_args = {}
 
-        # All weights come from the checkpoint, so no pretrained download is needed.
-        model = JointCBM(
-            backbone_name=training_args["backbone"],
-            pretrained=False,
-            num_concepts=112,
-            num_classes=200,
-            concept_activation=training_args.get("concept_activation", "none"),
-        )
+        # Explicit arguments take priority over checkpoint metadata.
+        model_type = model_type or training_args.get("model", "cbm")
+        backbone = backbone or training_args.get("backbone")
+        if not backbone:
+            raise ValueError("Please specify --backbone for checkpoints without args")
+
+        if model_type == "cem":
+            model = ConceptEmbeddingModel(
+                backbone=backbone,
+                pretrained=False,
+                n_concepts=112,
+                n_tasks=200,
+                emb_size=16,
+                training_intervention_prob=0.25,
+                c2y_layers=None,
+            )
+        elif model_type == "cbm":
+            concept_activation = concept_activation or training_args.get("concept_activation")
+            if concept_activation is None:
+                raise ValueError("Please specify --concept-activation for CBM checkpoints without args")
+            model = JointCBM(
+                backbone_name=backbone,
+                pretrained=False,
+                num_concepts=112,
+                num_classes=200,
+                concept_activation=concept_activation,
+            )
+        else:
+            raise ValueError(f"Unsupported model type: {model_type}")
+
         model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     else:
-        raise ValueError(
-            "Expected a complete model or a checkpoint containing model_state_dict and args"
-        )
+        raise ValueError("Expected a model or a checkpoint containing model_state_dict")
 
     model = model.to(device)
     model.eval()
@@ -169,6 +193,15 @@ def parse_args(argv=None):
         help="Default: checkpoint training setting, or imagenet for complete-model files",
     )
     parser.add_argument("--output", help="Optional JSON file for evaluation results")
+    # Architecture settings for checkpoints without training arguments.
+    parser.add_argument("--model-type", choices=["cbm", "cem"], default=None)
+    parser.add_argument(
+        "--backbone", choices=["resnet18", "resnet18_ptcv_cub", "resnet50"], default=None,
+    )
+    parser.add_argument(
+        "--concept-activation", choices=["none", "sigmoid"], default=None,
+        help="CBM activation used during training; required for state dicts without args",
+    )
 
     args = parser.parse_args(argv)
     if args.batch_size < 1 or args.num_workers < 0:
@@ -184,7 +217,12 @@ def main(argv=None):
     device = torch.device(device_name)
 
     checkpoint_path = Path(args.checkpoint).expanduser().resolve()
-    model, training_args = load_model(checkpoint_path, device)
+    model, training_args = load_model(
+        checkpoint_path, device,
+        model_type=args.model_type,
+        backbone=args.backbone,
+        concept_activation=args.concept_activation,
+    )
     normalization = args.normalization or training_args.get("normalization", "imagenet")
     data_dir = Path(args.data_dir).expanduser().resolve()
     image_dir = Path(args.image_dir).expanduser().resolve()
