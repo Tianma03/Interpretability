@@ -1,10 +1,10 @@
-"""Train the ResNet18 Joint CBM on the original binary CUB112 annotations.
+"""Train Joint CBM or CEM on the original binary CUB112 annotations.
 
 Reference: https://github.com/yewsiang/ConceptBottleneck/blob/master/CUB/train.py
 
-The objective, optimizers, learning-rate schedule, model selection, and epoch
-summary follow the original Joint training code. Early stopping retains the
-100-epoch accuracy patience but removes the upstream low-accuracy cutoff.
+With a validation split, learning-rate scheduling uses fixed ReduceLROnPlateau
+settings. Train+val retraining retains StepLR. Early stopping can monitor loss
+or accuracy; best weights always use classification accuracy.
 ResNet18 uses 224-pixel inputs and has no Inception auxiliary branch. ImageNet
 normalization is used for the ResNet backbones by default; --normalization upstream selects the original
 dataset.py normalization instead. No test data is used for model selection.
@@ -149,7 +149,7 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
             )
             # Pass concept labels to CEM only during training.
             if is_training and isinstance(model, ConceptEmbeddingModel):
-                outputs = model(images, concept=concept_labels)
+                outputs = model(images, concepts=concept_labels)
             else:
                 outputs= model(images)
                 
@@ -226,7 +226,7 @@ def train(args):
         model = ConceptEmbeddingModel(
             backbone=args.backbone,
             pretrained=args.pretrained,
-            n_concepts=NUM_CLASSES,
+            n_concepts=NUM_CONCEPTS,
             n_tasks=NUM_CLASSES,
             emb_size=16,
             training_intervention_prob=0.25,
@@ -253,22 +253,29 @@ def train(args):
     ).to(device)
 
     optimizer = build_optimizer(model, args)
-    scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer,
-        step_size=args.scheduler_step,
-        gamma=LR_DECAY_SIZE,
-    )
-    stop_epoch = int(math.log(MIN_LR / args.lr) / math.log(LR_DECAY_SIZE)) * args.scheduler_step
+    if not args.ckpt:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.1, patience=20, min_lr=1e-4,
+        )
+        stop_epoch = None
+    else:
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.scheduler_step, gamma=LR_DECAY_SIZE)
+        stop_epoch = int(math.log(MIN_LR / args.lr) / math.log(LR_DECAY_SIZE)) * args.scheduler_step
 
     best_val_epoch = -1
     best_val_acc = 0.0
+    best_stop_epoch = -1
+    best_stop_value = math.inf if args.early_stopping_monitor == "loss" else 0.0
     logger = Logger(log_dir / "log.txt")
 
     try:
         logger.write(str(args) + "\n")
         logger.write(str(imbalance) + "\n")
         logger.write(f"Device: {device}\n")
-        logger.write(f"Stop epoch:  {stop_epoch}\n")
+        if stop_epoch is not None:
+            logger.write(f"Stop epoch:  {stop_epoch}\n")
+        else:
+            logger.write("ReduceLROnPlateau: val loss, patience=20, factor=0.1, min_lr=1e-4\n")
         logger.write(f"train data path: {Path(args.data_dir).expanduser().resolve() / 'train.pkl'}\n")
         if args.ckpt:
             logger.write("Retraining on train + val; Val metrics below reuse Train metrics (upstream ckpt mode).\n")
@@ -283,11 +290,17 @@ def train(args):
                 else:
                     val_metrics = dict(train_metrics)
 
+                # Stopping and checkpoint selection can monitor different metrics.
+                stop_value = val_metrics[args.early_stopping_monitor]
+                improved = stop_value < best_stop_value if args.early_stopping_monitor == "loss" else stop_value > best_stop_value
+                if improved:
+                    best_stop_value, best_stop_epoch = stop_value, epoch
+
                 if val_metrics["accuracy"] > best_val_acc:
                     best_val_epoch = epoch
                     best_val_acc = val_metrics["accuracy"]
                     logger.write("New model best model at epoch %d\n" % epoch)
-                    # Preserve the upstream whole-model artifact and filename.
+                    # Save the weights with the best classification accuracy.
                     torch.save(
                         {"model_state_dict": model.state_dict()},
                         log_dir / f"best_model_{args.seed}.pth",
@@ -319,18 +332,25 @@ def train(args):
                     )
                 )
 
-                update_learning_rate(scheduler, epoch, stop_epoch)
+                if not args.ckpt:
+                    scheduler.step(val_metrics["loss"])
+                else:
+                    update_learning_rate(scheduler, epoch, stop_epoch)
                 if epoch % 10 == 0:
                     logger.write(f"Current lr: {[group['lr'] for group in optimizer.param_groups]}\n")
 
                 metrics_file.write(json.dumps({
                     "epoch": epoch,
                     "lr": learning_rate,
+                    "lr_after_step": optimizer.param_groups[0]["lr"],
                     "train": train_metrics,
                     "val": val_metrics,
                     "validation_is_training": bool(args.ckpt),
                     "best_val_epoch": best_val_epoch,
                     "best_val_accuracy": best_val_acc,
+                    "early_stopping_monitor": args.early_stopping_monitor,
+                    "best_early_stopping_epoch": best_stop_epoch,
+                    "best_early_stopping_value": best_stop_value,
                 }) + "\n")
                 metrics_file.flush()
 
@@ -344,10 +364,12 @@ def train(args):
                     "concept_weights": imbalance,
                     "best_val_epoch": best_val_epoch,
                     "best_val_accuracy": best_val_acc,
+                    "best_early_stopping_epoch": best_stop_epoch,
+                    "best_early_stopping_value": best_stop_value,
                 }, log_dir / "last_checkpoint.pth")
 
-                if epoch - best_val_epoch >= 100:
-                    logger.write("Early stopping because acc hasn't improved for a long time\n")
+                if epoch - best_stop_epoch >= args.early_stopping_patience:
+                    logger.write(f"Early stopping because val {args.early_stopping_monitor} has not improved\n")
                     break
     finally:
         logger.close()
@@ -365,16 +387,18 @@ def parse_args(argv=None):
     parser.add_argument("--log-dir", "-log_dir", default=None)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--model", choices=["cbm", "cem"], default="cbm")
-    parser.add_argument("--backbone", choices=["resnet18", "resnet18_ptcv_cub"], default="resnet18")
+    parser.add_argument("--backbone", choices=["resnet18", "resnet18_ptcv_cub", "resnet50"], default="resnet18")
     parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--freeze-backbone", action="store_true")
     parser.add_argument("--concept-activation", choices=["none", "sigmoid"], default="none")
     parser.add_argument("--epochs", "-e", type=int, default=1000)
+    parser.add_argument("--early-stopping-patience", type=int, default=100)
+    parser.add_argument("--early-stopping-monitor", choices=["accuracy", "loss"], default="accuracy")
     parser.add_argument("--batch-size", "-b", type=int, default=64)
     parser.add_argument("--optimizer", "-optimizer", type=str.lower, choices=["sgd", "adam", "rmsprop"], default="sgd")
     parser.add_argument("--lr", "-lr", type=float, default=0.001)
     parser.add_argument("--weight-decay", "-weight_decay", type=float, default=0.0004)
-    parser.add_argument("--scheduler-step", "-scheduler_step", type=int, default=1000)
+    parser.add_argument("--scheduler-step", "-scheduler_step", type=int, default=1000, help="StepLR interval for --ckpt 1 only")
     parser.add_argument("--attr-loss-weight", "-attr_loss_weight", type=float, default=0.01)
     parser.add_argument("--weighted-loss", "-weighted_loss", choices=["multiple", "single", "none"], default="multiple")
     parser.add_argument("--normalize-loss", action=argparse.BooleanOptionalAction, default=True)
@@ -394,6 +418,12 @@ def parse_args(argv=None):
         parser.error("attr-loss-weight must be finite and nonnegative")
     if args.num_workers < 0:
         parser.error("num-workers must be nonnegative")
+    if args.early_stopping_patience < 1:
+        parser.error("early-stopping-patience must be positive")
+    if not args.ckpt and args.lr < 1e-5:
+        parser.error("lr must be at least the fixed plateau minimum of 1e-5")
+    if args.ckpt and args.early_stopping_monitor == "loss":
+        parser.error("validation-loss early stopping requires --ckpt 0")
     return args
 
 
